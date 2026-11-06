@@ -213,6 +213,10 @@ local DB_DEFAULTS = {
         objectiveCompareStrict = false,
         showUpcomingSplitTargets = false,
         showFastestRunSplits = false,
+        showPersonalBestBar = false,
+        personalBestBarMode = "LEVEL",
+        personalBestBarSource = "FASTEST",
+        personalBestBarHeight = 14,
         frameWidth        = 260,
         barWidth          = 210,
         barHeight         = 8,
@@ -683,6 +687,7 @@ local function SaveFastestRunSplits()
             local previousRunTime = store[scopeKey].overallRunTime
             if not previousRunTime or elapsed < previousRunTime then
                 store[scopeKey].overallRunTime = elapsed
+                store[scopeKey].level = run.level
                 for objectiveIndex, objective in ipairs(run.objectives) do
                     local t = objective.elapsed
                     store[scopeKey][objectiveIndex] = (t and t > 0) and t or nil
@@ -690,6 +695,112 @@ local function SaveFastestRunSplits()
             end
         end
     end
+end
+
+-- The highest key level finished within the timer, per dungeon (same shape as a
+-- fastest-run scope plus "level"). A higher level replaces it; the same level
+-- only when faster. Called once per completion, like SaveFastestRunSplits.
+local function SaveHighestKeyRun()
+    local store = EnsureProfileStore("highestKeyRuns")
+    if not store then return end
+    local run = currentRun
+    local elapsed, level = run.elapsed, run.level
+    if type(elapsed) ~= "number" or (issecretvalue and issecretvalue(elapsed)) or elapsed <= 0 then return end
+    local scopeKey = GetScopeKey(run, COMPARE_DUNGEON)
+    if not scopeKey or not level or level <= 0 then return end
+    local inTime = run.onTime
+    if inTime == nil then inTime = run.maxTime > 0 and elapsed <= run.maxTime end
+    if not inTime then return end
+
+    local record = store[scopeKey]
+    if record then
+        local recordLevel = record.level or 0
+        if recordLevel > level or (recordLevel == level and elapsed >= (record.overallRunTime or elapsed + 1)) then
+            return
+        end
+    else
+        record = {}
+        store[scopeKey] = record
+    end
+    wipe(record)
+    record.level = level
+    record.overallRunTime = elapsed
+    for objectiveIndex, objective in ipairs(run.objectives) do
+        local t = objective.elapsed
+        if t and t > 0 then record[objectiveIndex] = t end
+    end
+end
+
+-- Personal best bar. The reference is a copy of the benchmark run, taken while
+-- the key runs: SaveFastestRunSplits rewrites the stored scope in place on
+-- completion, which would otherwise make a new best compare against itself.
+-- Source FASTEST reads the quickest run of the chosen scope, HIGHEST the highest
+-- in-time key of the dungeon; either falls back to the other when it has no record.
+local function PersonalBestKey(p)
+    return (p.personalBestBarSource == "HIGHEST" and "HIGHEST" or "FASTEST")
+        .. ":" .. (p.personalBestBarMode or COMPARE_LEVEL)
+end
+
+local function SnapshotPersonalBest(run, p)
+    run.pbMode = PersonalBestKey(p)
+    local profile = db and db.profile
+    local mode = p.personalBestBarMode or COMPARE_LEVEL
+    local fastestStore = profile and profile.fastestRunSplits
+    local fastestKey = GetScopeKey(run, mode)
+    local fastest = fastestStore and fastestKey and fastestStore[fastestKey]
+    if not (fastest and fastest.overallRunTime) then fastest = nil end
+    local highestStore = profile and profile.highestKeyRuns
+    local highestKey = GetScopeKey(run, COMPARE_DUNGEON)
+    local highest = highestStore and highestKey and highestStore[highestKey]
+    if not (highest and highest.overallRunTime) then highest = nil end
+
+    local scope
+    if p.personalBestBarSource == "HIGHEST" then scope = highest or fastest else scope = fastest or highest end
+    if not scope then
+        run.pbRef = nil
+        return
+    end
+    local ref = run.pbRef or {}
+    wipe(ref)
+    for k, v in pairs(scope) do ref[k] = v end
+    -- Level scopes record their own level only from now on: older ones are the run's.
+    ref.level = scope.level or (scope == fastest and mode ~= COMPARE_DUNGEON and run.level) or nil
+    run.pbRef = ref
+end
+
+local function GetPersonalBestRef(run, p)
+    local key = PersonalBestKey(p)
+    if run.pbMode ~= key and not run.completed then
+        SnapshotPersonalBest(run, p)
+    end
+    return run.pbMode == key and run.pbRef or nil
+end
+
+-- Seconds behind (+) or ahead (-) of the best run at the same point of the key:
+-- the lag at the latest finished objective, widened once the clock passes the
+-- best run's time for the next unfinished one. Final time vs best once complete.
+local function GetPersonalBestDelta(run, ref)
+    local elapsed = run.elapsed
+    if type(elapsed) ~= "number" or (issecretvalue and issecretvalue(elapsed)) then return nil end
+    if run.completed then return elapsed - ref.overallRunTime end
+
+    local delta, latest, nextTarget = 0, -1, nil
+    for i, obj in ipairs(run.objectives) do
+        local target = ref[i]
+        if target then
+            if obj.completed and obj.elapsed and obj.elapsed > 0 then
+                if obj.elapsed > latest then
+                    latest = obj.elapsed
+                    delta = obj.elapsed - target
+                end
+            elseif not nextTarget or target < nextTarget then
+                nextTarget = target
+            end
+        end
+    end
+    nextTarget = nextTarget or ref.overallRunTime
+    if elapsed > nextTarget then delta = max(delta, elapsed - nextTarget) end
+    return delta
 end
 
 local function BuildSplitCompareText(referenceTime, currentTime, deltaOnly, fasterColor, slowerColor)
@@ -873,6 +984,7 @@ local function UpdateObjectives()
 
     if currentRun.completed then
         SaveFastestRunSplits()
+        SaveHighestKeyRun()
     end
 
     for i = numCriteria + 1, #currentRun.objectives do
@@ -1127,6 +1239,12 @@ local function StartRun()
     currentRun._lastDungeonComplete = false
     currentRun._weightedObj = nil  -- populated by UpdateObjectives
     wipe(currentRun.objectives)
+    currentRun.pbMode = nil
+    currentRun.pbRef = nil
+    currentRun.onTime = nil
+    if db and db.profile and db.profile.showPersonalBestBar then
+        SnapshotPersonalBest(currentRun, db.profile)
+    end
 
     StartTimerLoop()
     OnTimerTick()  -- prime the display immediately
@@ -1148,6 +1266,7 @@ local function CompleteRun()
         and C_ChallengeMode.GetChallengeCompletionInfo()
     if completionInfo and completionInfo.time and completionInfo.time > 0 then
         currentRun.elapsed = completionInfo.time / 1000
+        currentRun.onTime = completionInfo.onTime
     else
         local elapsedTime = select(2, GetWorldElapsedTime(1))
         currentRun.elapsed = elapsedTime or currentRun.elapsed
@@ -1181,6 +1300,9 @@ local function ResetRun()
     currentRun._lastDungeonComplete = false
     wipe(currentRun.affixes)
     wipe(currentRun.objectives)
+    currentRun.pbMode = nil
+    currentRun.pbRef = nil
+    currentRun.onTime = nil
     -- The saved splits stay: re-entering this run uses them again, and the
     -- next key drops them (StartRun, CheckSavedSplits).
 
@@ -1215,6 +1337,9 @@ local PREVIEW_RUN = {
         { name = "Enemy Forces",            completed = false, elapsed = 0,    quantity = 78.42, totalQuantity = 100, rawQuantity = 188, rawTotalQuantity = 240, percent = 78.42, isWeighted = true },
     },
 }
+
+-- Best run the preview compares against (PREVIEW_RUN's previewSplit values).
+local PREVIEW_PB_REF = { overallRunTime = 1790, level = 12, 528, 972, 1500, 1770 }
 
 -- The preview is a hardcoded dummy run, so its dungeon and affix names would stay
 -- English on every client. Both carry an ID and the live-run path already resolves
@@ -1404,6 +1529,9 @@ ns.ApplyBorder = function()
     local forcesSize, forcesPx = size, px
     if p.borderApplyToForces == false then forcesSize, forcesPx = 0, nil end
     ApplyBorderTo(f, f._enemyBarHost or f._enemyBarBg, "_emtEnemyBorderFrame", p, forcesSize, texKey, r, g, b, a, forcesPx)
+    if f._pbBarHost then
+        ApplyBorderTo(f, f._pbBarHost, "_emtPbBorderFrame", p, size, texKey, r, g, b, a, px)
+    end
 
     -- Segment bars (timer bar SEGMENTS mode) -- border each segment host.
     local segSize, segPx = 0, nil
@@ -3029,6 +3157,84 @@ local function RenderStandalone()
         RenderThresholdText()
     end
 
+    -- Personal best bar: fills toward the best run's time, delta against its pace.
+    local pbRef = p.showPersonalBestBar == true
+        and (isPreview and PREVIEW_PB_REF or GetPersonalBestRef(run, p)) or nil
+    local pbDelta = pbRef and GetPersonalBestDelta(run, pbRef)
+    if pbDelta then
+        local pbH = p.personalBestBarHeight or 14
+        local pbW = math.min(p.barWidth or 210, innerW - TBAR_PAD * 2)
+        if pbW < 60 then pbW = 60 end
+
+        local pbHost, pbClip = EnsureBarShell(f, "_pbBarHost")
+        EnsureShellTextures(pbClip, f, "_pbBarBg", "_pbBarFill")
+        if not f._pbLabelFS then
+            f._pbLabelFS = f:CreateFontString(nil, "OVERLAY")
+            f._pbLabelFS:SetParent(f._emtTextLayer)
+            f._pbLabelFS:SetWordWrap(false)
+            f._pbLabelFS:SetJustifyH("LEFT")
+            f._pbDeltaFS = f:CreateFontString(nil, "OVERLAY")
+            f._pbDeltaFS:SetParent(f._emtTextLayer)
+            f._pbDeltaFS:SetWordWrap(false)
+            f._pbDeltaFS:SetJustifyH("RIGHT")
+        end
+
+        local pbInset = GetBarBleedInset(p, false)
+        pbHost:ClearAllPoints()
+        local pbAlign = _ra(p.timerAlign or "CENTER")
+        if pbAlign == "RIGHT" then
+            pbHost:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD + TBAR_PAD), y)
+        elseif pbAlign == "LEFT" then
+            pbHost:SetPoint("TOPLEFT", f, "TOPLEFT", PAD + TBAR_PAD, y)
+        else
+            pbHost:SetPoint("TOP", f, "TOP", 0, y)
+        end
+        pbHost:SetSize(pbW, pbH)
+        LayoutBarClip(pbHost, pbClip, pbInset)
+        pbHost:Show()
+
+        local fR, fG, fB
+        if pbDelta > 0 then
+            fR, fG, fB = GetColor(p.splitSlowerColor, 1, 0.45, 0.45)
+        else
+            fR, fG, fB = GetColor(p.splitFasterColor, 0.4, 1, 0.4)
+        end
+        ApplyBarTexture(f._pbBarBg, p.barBgTexture, 0.12, 0.12, 0.12, 0.9)
+        f._pbBarBg:SetAllPoints(pbClip)
+        f._pbBarBg:Show()
+        local pbPct = min(1, max(0, (run.elapsed or 0) / pbRef.overallRunTime))
+        f._pbBarFill:ClearAllPoints()
+        f._pbBarFill:SetPoint("TOPLEFT", pbClip, "TOPLEFT", 0, 0)
+        f._pbBarFill:SetSize(max(1, (pbW - pbInset * 2) * pbPct), max(1, pbH - pbInset * 2))
+        ApplyBarTexture(f._pbBarFill, p.barTexture, fR, fG, fB, 0.55)
+        f._pbBarFill:Show()
+
+        local pbTextSize = max(8, min(12, pbH - 2))
+        SetFS(f._pbLabelFS, pbTextSize)
+        ApplyShadow(f._pbLabelFS)
+        f._pbLabelFS:SetTextColor(0.85, 0.85, 0.85)
+        SetTextDiff(f._pbLabelFS, pbRef.level
+            and EllesmereUI.Lf("Best +%1$d  %2$s", pbRef.level, FormatTime(pbRef.overallRunTime))
+            or EllesmereUI.Lf("Best %s", FormatTime(pbRef.overallRunTime)))
+        f._pbLabelFS:ClearAllPoints()
+        f._pbLabelFS:SetPoint("LEFT", pbHost, "LEFT", 5, 0)
+        f._pbLabelFS:Show()
+
+        SetFS(f._pbDeltaFS, pbTextSize)
+        ApplyShadow(f._pbDeltaFS)
+        local pbSign = pbDelta < 0 and "-" or (pbDelta > 0 and "+" or "")
+        SetTextDiff(f._pbDeltaFS, format("%s%s%s|r", EllesmereUI.HexColor(fR, fG, fB), pbSign, FormatTime(abs(pbDelta))))
+        f._pbDeltaFS:ClearAllPoints()
+        f._pbDeltaFS:SetPoint("RIGHT", pbHost, "RIGHT", -5, 0)
+        f._pbDeltaFS:Show()
+
+        y = y - pbH - ROW_GAP
+    elseif f._pbBarHost then
+        f._pbBarHost:Hide()
+        f._pbLabelFS:Hide()
+        f._pbDeltaFS:Hide()
+    end
+
     -- Objectives
     local objIdx = 0
     if p.showObjectives then
@@ -3409,6 +3615,14 @@ function EMT:OnInitialize()
                 local mapID = tonumber(mapIDStr)
                 if mapID and not validMapIDs[mapID] then
                     db.profile.fastestRunSplits[scopeKey] = nil
+                end
+            end
+        end
+        if db.profile.highestKeyRuns then
+            for scopeKey in pairs(db.profile.highestKeyRuns) do
+                local mapID = tonumber(tostring(scopeKey):match("^(%d+)"))
+                if mapID and not validMapIDs[mapID] then
+                    db.profile.highestKeyRuns[scopeKey] = nil
                 end
             end
         end

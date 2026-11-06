@@ -1214,6 +1214,53 @@ initFrame:SetScript("OnEvent", function(self)
         end
         y = y - h
 
+        _, h = W:SectionHeader(parent, "PERSONAL BEST BAR", y); y = y - h
+
+        local personalBestModeValues = {
+          DUNGEON = "Per Dungeon",
+          LEVEL = "Per Dungeon + Level",
+          LEVEL_AFFIX = "Per Dungeon + Level + Affixes",
+        }
+        local personalBestModeOrder = { "DUNGEON", "LEVEL", "LEVEL_AFFIX" }
+        local personalBestSourceValues = { FASTEST = "Fastest Key", HIGHEST = "Highest Key" }
+        local personalBestSourceOrder = { "FASTEST", "HIGHEST" }
+        local function PersonalBestOff() return Cfg("enabled") == false or Cfg("showPersonalBestBar") ~= true end
+        local function PersonalBestOffTip()
+            if Cfg("enabled") == false then return "the module" end
+            return "Show Personal Best Bar"
+        end
+
+        row, h = W:DualRow(parent, y,
+            { type="toggle", text="Show Personal Best Bar",
+              tooltip="Adds a bar under the timer that fills toward a benchmark run of the same dungeon (its key level is shown) and shows how far ahead or behind its pace you are. Hidden until you have a completed run to compare against.",
+              disabled=function() return Cfg("enabled") == false end,
+              disabledTooltip="the module",
+              getValue=function() return Cfg("showPersonalBestBar") == true end,
+              setValue=function(v) Set("showPersonalBestBar", v); Refresh() end },
+            { type="dropdown", text="Compare Against",
+              tooltip="Fastest Key mode: which of your fastest runs the bar compares against.",
+              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
+              values=personalBestModeValues,
+              order=personalBestModeOrder,
+              getValue=function() return Cfg("personalBestBarMode") or "LEVEL" end,
+              setValue=function(v) Set("personalBestBarMode", v); Refresh() end })
+        y = y - h
+
+        _, h = W:DualRow(parent, y,
+            { type="slider", text="Personal Best Bar Height",
+              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
+              min=10, max=30, step=1, isPercent=false,
+              getValue=function() return Cfg("personalBestBarHeight") or 14 end,
+              setValue=function(v) Set("personalBestBarHeight", v); Refresh() end },
+            { type="dropdown", text="Comparison Mode",
+              tooltip="Fastest Key: your quickest run of the chosen Compare Against scope. Highest Key: the highest key level you finished in time for this dungeon. Either falls back to the other when it has no recorded run.",
+              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
+              values=personalBestSourceValues,
+              order=personalBestSourceOrder,
+              getValue=function() return Cfg("personalBestBarSource") or "FASTEST" end,
+              setValue=function(v) Set("personalBestBarSource", v); Refresh() end })
+        y = y - h
+
         _, h = W:Spacer(parent, y, 20); y = y - h
 
         parent:SetHeight(math.abs(y - yOffset))
