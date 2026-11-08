@@ -572,7 +572,7 @@ initFrame:SetScript("OnEvent", function(self)
         -- Inline color swatch attached to a DualRow region (left of the control,
         -- chaining off rgn._lastInline so it coexists with an inline cog). Blocked
         -- + dimmed via overlay when isDisabled() is true, mirroring the cog pattern.
-        local function _AttachInlineSwatch(rgn, colorKey, defR, defG, defB, afterSet, isDisabled, disabledTip)
+        local function _AttachInlineSwatch(rgn, colorKey, defR, defG, defB, afterSet, isDisabled, disabledTip, enterTip)
             local PP = EllesmereUI.PP
             local swatch, updateSwatch = EllesmereUI.BuildColorSwatch(
                 rgn, rgn:GetFrameLevel() + 5,
@@ -589,6 +589,10 @@ initFrame:SetScript("OnEvent", function(self)
                 false, 18)
             PP.Point(swatch, "RIGHT", rgn._lastInline or rgn._control or rgn, "LEFT", -8, 0)
             rgn._lastInline = swatch
+            if enterTip then
+                swatch:HookScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(swatch, enterTip) end)
+                swatch:HookScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+            end
             local block = CreateFrame("Frame", nil, swatch)
             block:SetAllPoints()
             block:SetFrameLevel(swatch:GetFrameLevel() + 10)
@@ -1214,44 +1218,28 @@ initFrame:SetScript("OnEvent", function(self)
         end
         y = y - h
 
-        _, h = W:SectionHeader(parent, "PERSONAL BEST BAR", y); y = y - h
+        _, h = W:SectionHeader(parent, "BEST RUN MARKER", y); y = y - h
 
         local personalBestModeValues = {
           DUNGEON = "Per Dungeon",
           LEVEL = "Per Dungeon + Level",
-          LEVEL_AFFIX = "Per Dungeon + Level + Affixes",
         }
-        local personalBestModeOrder = { "DUNGEON", "LEVEL", "LEVEL_AFFIX" }
+        local personalBestModeOrder = { "DUNGEON", "LEVEL" }
         local personalBestSourceValues = { FASTEST = "Fastest Key", HIGHEST = "Highest Key" }
         local personalBestSourceOrder = { "FASTEST", "HIGHEST" }
         local function PersonalBestOff() return Cfg("enabled") == false or Cfg("showPersonalBestBar") ~= true end
         local function PersonalBestOffTip()
             if Cfg("enabled") == false then return "the module" end
-            return "Show Personal Best Bar"
+            return "Show Best Run Marker"
         end
 
         row, h = W:DualRow(parent, y,
-            { type="toggle", text="Show Personal Best Bar",
-              tooltip="Adds a bar under the timer that fills toward a benchmark run of the same dungeon (its key level is shown) and shows how far ahead or behind its pace you are. Hidden until you have a completed run to compare against.",
+            { type="toggle", text="Show Best Run Marker",
+              tooltip="Draws a line on the enemy forces bar where your benchmark run's forces were at this point of the key, so it moves at that run's pace. The line is coloured by the two swatches beside this toggle (hover each to see which is which): one while you are ahead of that pace, one while you are behind it. Hover the line for the benchmark's key level and time. The pace is recorded while this is on, so the line appears once a run has been completed with it enabled.",
               disabled=function() return Cfg("enabled") == false end,
               disabledTooltip="the module",
               getValue=function() return Cfg("showPersonalBestBar") == true end,
               setValue=function(v) Set("showPersonalBestBar", v); Refresh() end },
-            { type="dropdown", text="Compare Against",
-              tooltip="Fastest Key mode: which of your fastest runs the bar compares against.",
-              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
-              values=personalBestModeValues,
-              order=personalBestModeOrder,
-              getValue=function() return Cfg("personalBestBarMode") or "LEVEL" end,
-              setValue=function(v) Set("personalBestBarMode", v); Refresh() end })
-        y = y - h
-
-        _, h = W:DualRow(parent, y,
-            { type="slider", text="Personal Best Bar Height",
-              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
-              min=10, max=30, step=1, isPercent=false,
-              getValue=function() return Cfg("personalBestBarHeight") or 14 end,
-              setValue=function(v) Set("personalBestBarHeight", v); Refresh() end },
             { type="dropdown", text="Comparison Mode",
               tooltip="Fastest Key: your quickest run of the chosen Compare Against scope. Highest Key: the highest key level you finished in time for this dungeon. Either falls back to the other when it has no recorded run.",
               disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
@@ -1259,6 +1247,21 @@ initFrame:SetScript("OnEvent", function(self)
               order=personalBestSourceOrder,
               getValue=function() return Cfg("personalBestBarSource") or "FASTEST" end,
               setValue=function(v) Set("personalBestBarSource", v); Refresh() end })
+        _AttachInlineSwatch(row._leftRegion, "personalBestAheadColor", 0.4, 1, 0.4, nil,
+            PersonalBestOff, "Show Best Run Marker", "Ahead of Best Run (faster than its pace)")
+        _AttachInlineSwatch(row._leftRegion, "personalBestBehindColor", 1, 0.45, 0.45, nil,
+            PersonalBestOff, "Show Best Run Marker", "Behind Best Run (slower than its pace)")
+        y = y - h
+
+        _, h = W:DualRow(parent, y,
+            { type="dropdown", text="Compare Against",
+              tooltip="Fastest Key mode: which of your fastest runs the marker follows.",
+              disabled=PersonalBestOff, disabledTooltip=PersonalBestOffTip,
+              values=personalBestModeValues,
+              order=personalBestModeOrder,
+              getValue=function() return Cfg("personalBestBarMode") == "DUNGEON" and "DUNGEON" or "LEVEL" end,
+              setValue=function(v) Set("personalBestBarMode", v); Refresh() end },
+            EllesmereUI.BlankRowCfg())
         y = y - h
 
         _, h = W:Spacer(parent, y, 20); y = y - h

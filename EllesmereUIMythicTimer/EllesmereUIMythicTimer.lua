@@ -216,7 +216,8 @@ local DB_DEFAULTS = {
         showPersonalBestBar = false,
         personalBestBarMode = "LEVEL",
         personalBestBarSource = "FASTEST",
-        personalBestBarHeight = 14,
+        personalBestAheadColor = { r = 0.4, g = 1, b = 0.4 },
+        personalBestBehindColor = { r = 1, g = 0.45, b = 0.45 },
         frameWidth        = 260,
         barWidth          = 210,
         barHeight         = 8,
@@ -670,6 +671,24 @@ end
 -- bests: same shape (store[scopeKey][objectiveIndex] = elapsed) plus the
 -- run's own time under "overallRunTime", which decides whether a run
 -- replaces the stored one. Called once per completion from CompleteRun.
+-- Seconds at which the run reached each whole percent of forces. A run first
+-- seen past the opening percents (reload, bar enabled mid-key) records nothing.
+local function RecordForcesPace(percent)
+    local run = currentRun
+    local now = run.elapsed
+    if run.forcesPaceBad or type(now) ~= "number" or (issecretvalue and issecretvalue(now)) or now <= 0 then return end
+    local pct = min(100, floor(percent))
+    local pace = run.forcesPace
+    if not pace then
+        if pct >= 3 then run.forcesPaceBad = true; return end
+        pace = {}
+        run.forcesPace = pace
+        run.forcesPct = 0
+    end
+    for i = run.forcesPct + 1, pct do pace[i] = now end
+    if pct > run.forcesPct then run.forcesPct = pct end
+end
+
 local FASTEST_RUN_SCOPES = { COMPARE_DUNGEON, COMPARE_LEVEL, COMPARE_LEVEL_AFFIX }
 local function SaveFastestRunSplits()
     local store = EnsureProfileStore("fastestRunSplits")
@@ -688,6 +707,7 @@ local function SaveFastestRunSplits()
             if not previousRunTime or elapsed < previousRunTime then
                 store[scopeKey].overallRunTime = elapsed
                 store[scopeKey].level = run.level
+                store[scopeKey].forcesPace = (run.forcesPct == 100) and run.forcesPace or nil
                 for objectiveIndex, objective in ipairs(run.objectives) do
                     local t = objective.elapsed
                     store[scopeKey][objectiveIndex] = (t and t > 0) and t or nil
@@ -697,9 +717,7 @@ local function SaveFastestRunSplits()
     end
 end
 
--- The highest key level finished within the timer, per dungeon (same shape as a
--- fastest-run scope plus "level"). A higher level replaces it; the same level
--- only when faster. Called once per completion, like SaveFastestRunSplits.
+-- Highest in-time key per dungeon; the same level replaces it only when faster.
 local function SaveHighestKeyRun()
     local store = EnsureProfileStore("highestKeyRuns")
     if not store then return end
@@ -725,26 +743,29 @@ local function SaveHighestKeyRun()
     wipe(record)
     record.level = level
     record.overallRunTime = elapsed
+    record.forcesPace = (run.forcesPct == 100) and run.forcesPace or nil
     for objectiveIndex, objective in ipairs(run.objectives) do
         local t = objective.elapsed
         if t and t > 0 then record[objectiveIndex] = t end
     end
 end
 
--- Personal best bar. The reference is a copy of the benchmark run, taken while
--- the key runs: SaveFastestRunSplits rewrites the stored scope in place on
--- completion, which would otherwise make a new best compare against itself.
--- Source FASTEST reads the quickest run of the chosen scope, HIGHEST the highest
--- in-time key of the dungeon; either falls back to the other when it has no record.
+-- Best run marker. The benchmark is copied at key start so a new best does not
+-- compare against itself; FASTEST/HIGHEST fall back to each other.
+-- A saved affix scope reads as dungeon + level.
+local function PersonalBestScope(p)
+    return p.personalBestBarMode == COMPARE_DUNGEON and COMPARE_DUNGEON or COMPARE_LEVEL
+end
+
 local function PersonalBestKey(p)
     return (p.personalBestBarSource == "HIGHEST" and "HIGHEST" or "FASTEST")
-        .. ":" .. (p.personalBestBarMode or COMPARE_LEVEL)
+        .. ":" .. PersonalBestScope(p)
 end
 
 local function SnapshotPersonalBest(run, p)
     run.pbMode = PersonalBestKey(p)
     local profile = db and db.profile
-    local mode = p.personalBestBarMode or COMPARE_LEVEL
+    local mode = PersonalBestScope(p)
     local fastestStore = profile and profile.fastestRunSplits
     local fastestKey = GetScopeKey(run, mode)
     local fastest = fastestStore and fastestKey and fastestStore[fastestKey]
@@ -763,7 +784,7 @@ local function SnapshotPersonalBest(run, p)
     local ref = run.pbRef or {}
     wipe(ref)
     for k, v in pairs(scope) do ref[k] = v end
-    -- Level scopes record their own level only from now on: older ones are the run's.
+    -- Older level-scope records have no level; it is the run's.
     ref.level = scope.level or (scope == fastest and mode ~= COMPARE_DUNGEON and run.level) or nil
     run.pbRef = ref
 end
@@ -776,31 +797,17 @@ local function GetPersonalBestRef(run, p)
     return run.pbMode == key and run.pbRef or nil
 end
 
--- Seconds behind (+) or ahead (-) of the best run at the same point of the key:
--- the lag at the latest finished objective, widened once the clock passes the
--- best run's time for the next unfinished one. Final time vs best once complete.
-local function GetPersonalBestDelta(run, ref)
-    local elapsed = run.elapsed
-    if type(elapsed) ~= "number" or (issecretvalue and issecretvalue(elapsed)) then return nil end
-    if run.completed then return elapsed - ref.overallRunTime end
-
-    local delta, latest, nextTarget = 0, -1, nil
-    for i, obj in ipairs(run.objectives) do
-        local target = ref[i]
-        if target then
-            if obj.completed and obj.elapsed and obj.elapsed > 0 then
-                if obj.elapsed > latest then
-                    latest = obj.elapsed
-                    delta = obj.elapsed - target
-                end
-            elseif not nextTarget or target < nextTarget then
-                nextTarget = target
-            end
-        end
-    end
-    nextTarget = nextTarget or ref.overallRunTime
-    if elapsed > nextTarget then delta = max(delta, elapsed - nextTarget) end
-    return delta
+-- Forces percent the best run had at this elapsed time (interpolated); nil without pace.
+local function GetBestForcesPct(ref, elapsed)
+    local pace = ref.forcesPace
+    if not (pace and pace[1] and type(elapsed) == "number") then return nil end
+    local n = 0
+    while n < 100 and pace[n + 1] and pace[n + 1] <= elapsed do n = n + 1 end
+    if n >= 100 or not pace[n + 1] then return n end
+    local from = n > 0 and pace[n] or 0
+    local span = pace[n + 1] - from
+    if span <= 0 then return n end
+    return n + (elapsed - from) / span
 end
 
 local function BuildSplitCompareText(referenceTime, currentTime, deltaOnly, fasterColor, slowerColor)
@@ -971,6 +978,7 @@ local function UpdateObjectives()
                         obj.rawQuantity = obj.rawTotalQuantity
                     end
                 end
+                if db and db.profile.showPersonalBestBar then RecordForcesPace(obj.percent) end
             else
                 obj.isWeighted = false
                 obj.percent = 0
@@ -1242,6 +1250,7 @@ local function StartRun()
     currentRun.pbMode = nil
     currentRun.pbRef = nil
     currentRun.onTime = nil
+    currentRun.forcesPace, currentRun.forcesPct, currentRun.forcesPaceBad = nil, nil, nil
     if db and db.profile and db.profile.showPersonalBestBar then
         SnapshotPersonalBest(currentRun, db.profile)
     end
@@ -1303,6 +1312,7 @@ local function ResetRun()
     currentRun.pbMode = nil
     currentRun.pbRef = nil
     currentRun.onTime = nil
+    currentRun.forcesPace, currentRun.forcesPct, currentRun.forcesPaceBad = nil, nil, nil
     -- The saved splits stay: re-entering this run uses them again, and the
     -- next key drops them (StartRun, CheckSavedSplits).
 
@@ -1338,8 +1348,64 @@ local PREVIEW_RUN = {
     },
 }
 
--- Best run the preview compares against (PREVIEW_RUN's previewSplit values).
-local PREVIEW_PB_REF = { overallRunTime = 1790, level = 12, 528, 972, 1500, 1770 }
+-- Preview benchmark: 1% of forces per 17 s.
+local PREVIEW_PB_REF = { overallRunTime = 1790, level = 12, forcesPace = {} }
+for n = 1, 100 do PREVIEW_PB_REF.forcesPace[n] = n * 17 end
+
+-- Line on the forces bar where the benchmark run's forces were at this elapsed
+-- time, coloured by whether the run is ahead of or behind that pace.
+local function HideBestRunMarker(f)
+    if f._pbMarkHit then f._pbMarkHit:Hide() end
+end
+
+local function RenderBestRunMarker(f, p, run, isPreview, host, barW, inset, clipH, currentPct)
+    local ref = p.showPersonalBestBar == true
+        and (isPreview and PREVIEW_PB_REF or GetPersonalBestRef(run, p)) or nil
+    local bestPct = ref and not run.completed and GetBestForcesPct(ref, run.elapsed)
+    if not bestPct then
+        HideBestRunMarker(f)
+        return
+    end
+
+    local hit = f._pbMarkHit
+    if not hit then
+        hit = CreateFrame("Frame", nil, host)
+        hit:EnableMouse(true)
+        hit._tex = hit:CreateTexture(nil, "OVERLAY")
+        hit._tex:SetPoint("CENTER", hit, "CENTER", 0, 0)
+        hit:SetScript("OnEnter", function(self)
+            if EllesmereUI.ShowWidgetTooltip then EllesmereUI.ShowWidgetTooltip(self, self._tip) end
+        end)
+        hit:SetScript("OnLeave", function()
+            if EllesmereUI.HideWidgetTooltip then EllesmereUI.HideWidgetTooltip() end
+        end)
+        f._pbMarkHit = hit
+    end
+    hit:SetFrameLevel(host._clip:GetFrameLevel() + 3)
+
+    local _PP = EllesmereUI and EllesmereUI.PP
+    local markW = _PP and _PP.SnapForES(2, f:GetEffectiveScale()) or 2
+    local hitW = markW + 4
+    local clipW = max(1, barW - inset * 2)
+    local center = min(barW - markW / 2, max(markW / 2, inset + clipW * bestPct / 100))
+    hit:ClearAllPoints()
+    hit:SetSize(hitW, max(1, host:GetHeight()))
+    hit:SetPoint("LEFT", host, "LEFT", center - hitW / 2, 0)
+    hit._tex:SetSize(markW, clipH)
+    local mR, mG, mB
+    if currentPct >= bestPct then
+        mR, mG, mB = GetColor(p.personalBestAheadColor, 0.4, 1, 0.4)
+    else
+        mR, mG, mB = GetColor(p.personalBestBehindColor, 1, 0.45, 0.45)
+    end
+    hit._tex:SetColorTexture(mR, mG, mB, 0.9)
+    hit:Show()
+
+    local when, total = FormatTime(run.elapsed), FormatTime(ref.overallRunTime)
+    hit._tip = ref.level
+        and EllesmereUI.Lf("Best run +%1$d: %2$.1f%% at %3$s (finished in %4$s)", ref.level, bestPct, when, total)
+        or EllesmereUI.Lf("Best run: %1$.1f%% at %2$s (finished in %3$s)", bestPct, when, total)
+end
 
 -- The preview is a hardcoded dummy run, so its dungeon and affix names would stay
 -- English on every client. Both carry an ID and the live-run path already resolves
@@ -1529,9 +1595,6 @@ ns.ApplyBorder = function()
     local forcesSize, forcesPx = size, px
     if p.borderApplyToForces == false then forcesSize, forcesPx = 0, nil end
     ApplyBorderTo(f, f._enemyBarHost or f._enemyBarBg, "_emtEnemyBorderFrame", p, forcesSize, texKey, r, g, b, a, forcesPx)
-    if f._pbBarHost then
-        ApplyBorderTo(f, f._pbBarHost, "_emtPbBorderFrame", p, size, texKey, r, g, b, a, px)
-    end
 
     -- Segment bars (timer bar SEGMENTS mode) -- border each segment host.
     local segSize, segPx = 0, nil
@@ -2578,6 +2641,7 @@ local function RenderStandalone()
             f._enemyBarFill:Hide()
             if f._enemyBarText then f._enemyBarText:Hide() end
             HidePullSegments(f)
+            HideBestRunMarker(f)
             return
         end
 
@@ -2595,6 +2659,7 @@ local function RenderStandalone()
             f._enemyBarBg:Hide(); f._enemyBarFill:Hide()
             if f._enemyBarText then f._enemyBarText:Hide() end
             HidePullSegments(f)
+            HideBestRunMarker(f)
             return
         end
 
@@ -2673,6 +2738,8 @@ local function RenderStandalone()
             ApplyBarTexture(f._enemyBarFill, p.enemyBarTexture, eR, eG, eB, 0.8)
             f._enemyBarFill:Show()
             RenderPullSegments(f, enemyClip, run, enemyObj, p, clipW, clipH, eR, eG, eB)
+            RenderBestRunMarker(f, p, run, isPreview, enemyHost, barW, eInset, clipH,
+                enemyObj.completed and 100 or pctRaw)
 
             if not f._enemyBarText then
                 f._enemyBarText = f:CreateFontString(nil, "OVERLAY")
@@ -3155,84 +3222,6 @@ local function RenderStandalone()
 
     if not (underBarMode or p.timerBarStyle == "SEGMENTS") then
         RenderThresholdText()
-    end
-
-    -- Personal best bar: fills toward the best run's time, delta against its pace.
-    local pbRef = p.showPersonalBestBar == true
-        and (isPreview and PREVIEW_PB_REF or GetPersonalBestRef(run, p)) or nil
-    local pbDelta = pbRef and GetPersonalBestDelta(run, pbRef)
-    if pbDelta then
-        local pbH = p.personalBestBarHeight or 14
-        local pbW = math.min(p.barWidth or 210, innerW - TBAR_PAD * 2)
-        if pbW < 60 then pbW = 60 end
-
-        local pbHost, pbClip = EnsureBarShell(f, "_pbBarHost")
-        EnsureShellTextures(pbClip, f, "_pbBarBg", "_pbBarFill")
-        if not f._pbLabelFS then
-            f._pbLabelFS = f:CreateFontString(nil, "OVERLAY")
-            f._pbLabelFS:SetParent(f._emtTextLayer)
-            f._pbLabelFS:SetWordWrap(false)
-            f._pbLabelFS:SetJustifyH("LEFT")
-            f._pbDeltaFS = f:CreateFontString(nil, "OVERLAY")
-            f._pbDeltaFS:SetParent(f._emtTextLayer)
-            f._pbDeltaFS:SetWordWrap(false)
-            f._pbDeltaFS:SetJustifyH("RIGHT")
-        end
-
-        local pbInset = GetBarBleedInset(p, false)
-        pbHost:ClearAllPoints()
-        local pbAlign = _ra(p.timerAlign or "CENTER")
-        if pbAlign == "RIGHT" then
-            pbHost:SetPoint("TOPRIGHT", f, "TOPRIGHT", -(PAD + TBAR_PAD), y)
-        elseif pbAlign == "LEFT" then
-            pbHost:SetPoint("TOPLEFT", f, "TOPLEFT", PAD + TBAR_PAD, y)
-        else
-            pbHost:SetPoint("TOP", f, "TOP", 0, y)
-        end
-        pbHost:SetSize(pbW, pbH)
-        LayoutBarClip(pbHost, pbClip, pbInset)
-        pbHost:Show()
-
-        local fR, fG, fB
-        if pbDelta > 0 then
-            fR, fG, fB = GetColor(p.splitSlowerColor, 1, 0.45, 0.45)
-        else
-            fR, fG, fB = GetColor(p.splitFasterColor, 0.4, 1, 0.4)
-        end
-        ApplyBarTexture(f._pbBarBg, p.barBgTexture, 0.12, 0.12, 0.12, 0.9)
-        f._pbBarBg:SetAllPoints(pbClip)
-        f._pbBarBg:Show()
-        local pbPct = min(1, max(0, (run.elapsed or 0) / pbRef.overallRunTime))
-        f._pbBarFill:ClearAllPoints()
-        f._pbBarFill:SetPoint("TOPLEFT", pbClip, "TOPLEFT", 0, 0)
-        f._pbBarFill:SetSize(max(1, (pbW - pbInset * 2) * pbPct), max(1, pbH - pbInset * 2))
-        ApplyBarTexture(f._pbBarFill, p.barTexture, fR, fG, fB, 0.55)
-        f._pbBarFill:Show()
-
-        local pbTextSize = max(8, min(12, pbH - 2))
-        SetFS(f._pbLabelFS, pbTextSize)
-        ApplyShadow(f._pbLabelFS)
-        f._pbLabelFS:SetTextColor(0.85, 0.85, 0.85)
-        SetTextDiff(f._pbLabelFS, pbRef.level
-            and EllesmereUI.Lf("Best +%1$d  %2$s", pbRef.level, FormatTime(pbRef.overallRunTime))
-            or EllesmereUI.Lf("Best %s", FormatTime(pbRef.overallRunTime)))
-        f._pbLabelFS:ClearAllPoints()
-        f._pbLabelFS:SetPoint("LEFT", pbHost, "LEFT", 5, 0)
-        f._pbLabelFS:Show()
-
-        SetFS(f._pbDeltaFS, pbTextSize)
-        ApplyShadow(f._pbDeltaFS)
-        local pbSign = pbDelta < 0 and "-" or (pbDelta > 0 and "+" or "")
-        SetTextDiff(f._pbDeltaFS, format("%s%s%s|r", EllesmereUI.HexColor(fR, fG, fB), pbSign, FormatTime(abs(pbDelta))))
-        f._pbDeltaFS:ClearAllPoints()
-        f._pbDeltaFS:SetPoint("RIGHT", pbHost, "RIGHT", -5, 0)
-        f._pbDeltaFS:Show()
-
-        y = y - pbH - ROW_GAP
-    elseif f._pbBarHost then
-        f._pbBarHost:Hide()
-        f._pbLabelFS:Hide()
-        f._pbDeltaFS:Hide()
     end
 
     -- Objectives
